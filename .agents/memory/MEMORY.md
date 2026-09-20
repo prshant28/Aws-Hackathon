@@ -1,0 +1,1 @@
+- [Validated Replit config edits](replit-config-edits.md) — `.replit` changes require schema-validated replacement rather than a direct patch.
