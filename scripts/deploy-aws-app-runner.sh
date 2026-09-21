@@ -13,20 +13,33 @@ account_id="$(aws sts get-caller-identity --query Account --output text)"
 registry="${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 image_uri="${registry}/${ECR_REPOSITORY}:${IMAGE_TAG:-latest}"
 
-runtime_env="$(jq -n \
-  --arg region "$AWS_REGION" \
-  --arg deployment "${AWS_DEPLOYMENT_SERVICE:-App Runner}" \
-  '[{name:"AWS_REGION",value:$region},
-    {name:"AWS_DEPLOYMENT_SERVICE",value:$deployment}]')"
+runtime_env="$(
+  jq -n \
+    --arg region "$AWS_REGION" \
+    --arg deployment "${AWS_DEPLOYMENT_SERVICE:-App Runner}" \
+    '[
+      {name: "AWS_REGION", value: $region},
+      {name: "AWS_DEPLOYMENT_SERVICE", value: $deployment}
+    ]'
+)"
 
 runtime_secrets='{}'
+
 add_secret() {
   local env_name="$1"
   local arn="${!2:-}"
+
   if [[ -n "$arn" ]]; then
-    runtime_secrets="$(jq --arg key "$env_name" --arg value "$arn" '. + {($key): $value}' <<<"$runtime_secrets")"
+    runtime_secrets="$(
+      jq \
+        --arg key "$env_name" \
+        --arg value "$arn" \
+        '. + {($key): $value}' \
+        <<< "$runtime_secrets"
+    )"
   fi
 }
+
 add_secret "OPENAI_API_KEY" OPENAI_API_KEY_SECRET_ARN
 add_secret "GEMINI_API_KEY" GEMINI_API_KEY_SECRET_ARN
 add_secret "SESSION_SECRET" SESSION_SECRET_SECRET_ARN
@@ -34,30 +47,43 @@ add_secret "SESSION_SECRET" SESSION_SECRET_SECRET_ARN
 service_json="$(mktemp)"
 trap 'rm -f "$service_json"' EXIT
 
+# Build App Runner service configuration.
 jq -n \
   --arg image "$image_uri" \
   --arg access_role "$APP_RUNNER_ACCESS_ROLE_ARN" \
   --arg instance_role "${APP_RUNNER_INSTANCE_ROLE_ARN:-}" \
   --argjson env "$runtime_env" \
   --argjson secrets "$runtime_secrets" \
-  '{
+  '
+  {
     SourceConfiguration: {
       AutoDeploymentsEnabled: false,
-      AuthenticationConfiguration: {AccessRoleArn: $access_role},
+
+      AuthenticationConfiguration: {
+        AccessRoleArn: $access_role
+      },
+
       ImageRepository: {
         ImageIdentifier: $image,
         ImageRepositoryType: "ECR",
+
         ImageConfiguration: {
           Port: "8080",
-          RuntimeEnvironmentVariables: (reduce $env[] as $item ({}; .[$item.name] = $item.value)),
+
+          RuntimeEnvironmentVariables:
+            (reduce $env[] as $item
+              ({}; .[$item.name] = $item.value)),
+
           RuntimeEnvironmentSecrets: $secrets
         }
       }
     },
+
     InstanceConfiguration: {
       Cpu: "1 vCPU",
       Memory: "2 GB"
     },
+
     HealthCheckConfiguration: {
       Protocol: "HTTP",
       Path: "/health",
@@ -66,30 +92,77 @@ jq -n \
       HealthyThreshold: 1,
       UnhealthyThreshold: 5
     }
-    | if $instance_role != "" then .InstanceConfiguration.InstanceRoleArn = $instance_role else . end
-  }' > "$service_json"
+  }
 
-service_arn="$(aws apprunner describe-service \
-  --service-arn "$(aws apprunner list-services \
+  # Add InstanceRoleArn only when one was actually supplied.
+  | if $instance_role != ""
+    then .InstanceConfiguration.InstanceRoleArn = $instance_role
+    else .
+    end
+  ' > "$service_json"
+
+echo "=========================================="
+echo "AWS App Runner Deployment"
+echo "=========================================="
+echo "Region:      $AWS_REGION"
+echo "Repository:  $ECR_REPOSITORY"
+echo "Image:       $image_uri"
+echo "Service:     $APP_RUNNER_SERVICE"
+echo "=========================================="
+
+# Find existing App Runner service.
+service_arn="$(
+  aws apprunner list-services \
+    --region "$AWS_REGION" \
     --query "ServiceSummaryList[?ServiceName=='${APP_RUNNER_SERVICE}'].ServiceArn | [0]" \
-    --output text)" \
-  --query 'Service.ServiceArn' --output text 2>/dev/null || true)"
+    --output text
+)"
 
 if [[ -n "$service_arn" && "$service_arn" != "None" ]]; then
+
+  echo "Existing App Runner service found."
+  echo "Service ARN: $service_arn"
+  echo "Updating service..."
+
   update_json="$(mktemp)"
   trap 'rm -f "$service_json" "$update_json"' EXIT
-  jq --arg arn "$service_arn" \
-    '{ServiceArn:$arn,SourceConfiguration,InstanceConfiguration,HealthCheckConfiguration}' \
+
+  jq \
+    --arg arn "$service_arn" \
+    '{
+      ServiceArn: $arn,
+      SourceConfiguration: .SourceConfiguration,
+      InstanceConfiguration: .InstanceConfiguration,
+      HealthCheckConfiguration: .HealthCheckConfiguration
+    }' \
     "$service_json" > "$update_json"
+
   aws apprunner update-service \
+    --region "$AWS_REGION" \
     --cli-input-json "file://${update_json}" \
     --query 'Service.{Url:ServiceUrl,Status:Status}' \
     --output table
+
 else
-  jq --arg service "$APP_RUNNER_SERVICE" '. + {ServiceName:$service}' \
-    "$service_json" > "${service_json}.create"
+
+  echo "App Runner service does not exist."
+  echo "Creating service..."
+
+  create_json="$(mktemp)"
+  trap 'rm -f "$service_json" "$create_json"' EXIT
+
+  jq \
+    --arg service "$APP_RUNNER_SERVICE" \
+    '. + {ServiceName: $service}' \
+    "$service_json" > "$create_json"
+
   aws apprunner create-service \
-    --cli-input-json "file://${service_json}.create" \
+    --region "$AWS_REGION" \
+    --cli-input-json "file://${create_json}" \
     --query 'Service.{Url:ServiceUrl,Status:Status}' \
     --output table
+
 fi
+
+echo ""
+echo "App Runner deployment request submitted successfully."
