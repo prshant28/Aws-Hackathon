@@ -10,9 +10,9 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
-  ECR_REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY || 'recallx247' }}
-  APP_RUNNER_SERVICE: ${{ vars.AWS_APP_RUNNER_SERVICE || 'recallx247' }}
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: recallx247
+  APP_RUNNER_SERVICE: recallx247
   IMAGE_TAG: latest
 
 jobs:
